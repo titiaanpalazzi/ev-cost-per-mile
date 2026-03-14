@@ -590,7 +590,7 @@ elif page == "Compare Depot Locations":
         ]
     if "compare_depots_b" not in st.session_state:
         st.session_state.compare_depots_b = [
-            {"name": "Palo Alto", "lat": 37.4419, "lon": -122.1430, "stalls": 20},
+            {"name": "San Bruno", "lat": 37.6305, "lon": -122.4111, "stalls": 20},
         ]
 
     col_a, col_b = st.columns(2)
