@@ -581,7 +581,7 @@ if page == "Simulator":
 elif page == "Compare Depot Locations":
 
     st.subheader("Compare Depot Configurations")
-    st.caption("Edit the depot tables below, then press **Run Comparison** to simulate both configurations side by side.")
+    st.caption("This assumes the same simulated rides as the Simulator page. Edit the depot tables below, then press **Run Comparison** to simulate both configurations side by side.")
 
     # Defaults for the two configs
     if "compare_depots_a" not in st.session_state:
