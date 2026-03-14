@@ -5,6 +5,9 @@ import plotly.express as px
 import plotly.graph_objects as go
 from math import radians, cos, sin, asin, sqrt
 from pathlib import Path
+import json
+from shapely.geometry import shape, Point
+from shapely.prepared import prep
 
 st.set_page_config(page_title="EV Cost Per Mile", layout="wide")
 st.title("EV Cost Per Mile Simulator")
@@ -47,17 +50,81 @@ def nearest_depot(lat, lon, depots):
 # Data
 # ---------------------------------------------------------------------------
 
+def load_sf_boundary():
+    """Load SF land boundary polygon for filtering points."""
+    from shapely.ops import unary_union
+
+    # Prefer land-clipped census tracts (excludes water)
+    land_path = Path(__file__).parent / "data" / "sf_land.geojson"
+    if land_path.exists():
+        with open(land_path) as f:
+            geojson = json.load(f)
+        # Union all tract polygons to get a single land boundary
+        polygons = [shape(feature["geometry"]) for feature in geojson["features"]]
+        land = unary_union(polygons)
+        return prep(land)
+
+    # Fallback to old boundary file (includes water)
+    boundary_path = Path(__file__).parent / "data" / "sf_boundary.geojson"
+    if boundary_path.exists():
+        with open(boundary_path) as f:
+            geojson = json.load(f)
+        polygon = shape(geojson)
+        return prep(polygon)
+
+    return None
+
+
+SF_BOUNDARY = load_sf_boundary()
+
+
+def point_on_land(lat, lon):
+    """Check if a lat/lon point is within SF land boundary."""
+    if SF_BOUNDARY is None:
+        return True  # No boundary file, accept all points
+    return SF_BOUNDARY.contains(Point(lon, lat))  # Note: Point takes (x, y) = (lon, lat)
+
+
 def generate_sample_data(n=20000, seed=42):
+    """Generate synthetic ride data with all points on land."""
     rng = np.random.default_rng(seed)
     lat_center, lon_center = 37.77, -122.42
-    pickup_lat = rng.normal(lat_center, 0.02, n)
-    pickup_lon = rng.normal(lon_center, 0.02, n)
-    dropoff_lat = pickup_lat + rng.normal(0, 0.03, n)
-    dropoff_lon = pickup_lon + rng.normal(0, 0.03, n)
+
+    # Generate more candidates than needed, then filter to land
+    oversample = 2.0  # Generate 2x points to account for filtering
+    n_candidates = int(n * oversample)
+
+    pickup_lat = rng.normal(lat_center, 0.02, n_candidates)
+    pickup_lon = rng.normal(lon_center, 0.02, n_candidates)
+    dropoff_lat = pickup_lat + rng.normal(0, 0.03, n_candidates)
+    dropoff_lon = pickup_lon + rng.normal(0, 0.03, n_candidates)
+
+    # Filter to points on land
+    if SF_BOUNDARY is not None:
+        valid = []
+        for i in range(n_candidates):
+            if (point_on_land(pickup_lat[i], pickup_lon[i]) and
+                point_on_land(dropoff_lat[i], dropoff_lon[i])):
+                valid.append(i)
+            if len(valid) >= n:
+                break
+        valid = valid[:n]
+        pickup_lat = pickup_lat[valid]
+        pickup_lon = pickup_lon[valid]
+        dropoff_lat = dropoff_lat[valid]
+        dropoff_lon = dropoff_lon[valid]
+        actual_n = len(valid)
+    else:
+        actual_n = n
+        pickup_lat = pickup_lat[:n]
+        pickup_lon = pickup_lon[:n]
+        dropoff_lat = dropoff_lat[:n]
+        dropoff_lon = dropoff_lon[:n]
+
     base = pd.Timestamp("2024-06-01")
-    timestamps = [base + pd.Timedelta(minutes=int(m)) for m in rng.integers(0, 30 * 24 * 60, n)]
-    durations = rng.exponential(15, n).clip(3, 90)
-    prices = rng.exponential(18, n).clip(5, 80)
+    timestamps = [base + pd.Timedelta(minutes=int(m)) for m in rng.integers(0, 30 * 24 * 60, actual_n)]
+    durations = rng.exponential(15, actual_n).clip(3, 90)
+    prices = rng.exponential(18, actual_n).clip(5, 80)
     return pd.DataFrame({
         "request_timestamp": timestamps,
         "pickup_latitude": pickup_lat,
@@ -70,7 +137,7 @@ def generate_sample_data(n=20000, seed=42):
 
 
 @st.cache_data
-def load_data(n_rides=20000):
+def load_data(n_rides=60000, _version=4):  # bump version to invalidate cache
     data_dir = Path(__file__).parent / "data"
     csv_path = data_dir / "sf_waymo_estimates.csv"
     if csv_path.exists():
@@ -78,7 +145,7 @@ def load_data(n_rides=20000):
     else:
         df = generate_sample_data(n=n_rides)
         st.info(
-            "Using **simulated data**. To use real Waymo data, download "
+            "Using **simulated data**. To use real data, download"
             "[this Kaggle dataset](https://www.kaggle.com/datasets/npurav/waymo-rides-estimates) "
             "and place `sf_waymo_estimates.csv` in the `data/` folder."
         )
@@ -108,8 +175,10 @@ charge_threshold = st.sidebar.slider("Charge when battery below (%)", 5, 40, 20)
 charge_speed_kw = st.sidebar.slider("Charging speed (kW)", 7, 250, 150)
 
 st.sidebar.header("Cost Parameters")
+lease_per_stall = st.sidebar.number_input("Lease price ($/stall/mo)", 0, 50000, 800, 100, format="%d")
 purchase_price = st.sidebar.number_input("Vehicle purchase price ($)", 20000, 150000, 80000, 1000)
-lifetime_miles = st.sidebar.number_input("Expected lifetime miles", 50000, 500000, 200000, 10000)
+lifetime_miles = st.sidebar.number_input("Expected lifetime miles", 50000, 500000, 400000, 10000)
+cleaning_per_mile = st.sidebar.slider("Cleaning & plug-ins ($/mile)", 0.00, 0.50, 0.20, 0.01)
 electricity_offpeak = st.sidebar.slider("Off-peak electricity ($/kWh)", 0.05, 0.50, 0.20, 0.01)
 electricity_peak = st.sidebar.slider("Peak electricity ($/kWh)", 0.10, 0.80, 0.40, 0.01)
 peak_start, peak_end = 16, 21
@@ -120,10 +189,11 @@ tire_per_mile = st.sidebar.slider("Tire wear ($/mile)", 0.00, 0.06, 0.02, 0.005)
 
 st.sidebar.header("Cost Components")
 include_electricity = st.sidebar.checkbox("Electricity", True)
-include_depreciation = st.sidebar.checkbox("Depreciation", True)
+include_depreciation = st.sidebar.checkbox("Vehicle Depreciation", True)
 include_maintenance = st.sidebar.checkbox("Maintenance", True)
 include_insurance = st.sidebar.checkbox("Insurance", True)
 include_tires = st.sidebar.checkbox("Tire wear", True)
+include_cleaning = st.sidebar.checkbox("Cleaning & plug-ins", True)
 include_deadhead = st.sidebar.checkbox("Deadhead (to depot)", True)
 include_depot_lease = st.sidebar.checkbox("Depot lease", True)
 
@@ -138,7 +208,7 @@ st.caption(
 )
 
 DEFAULT_DEPOTS = [
-    {"lat": 37.7749, "lon": -122.4194, "name": "Downtown", "lease_per_stall": 2000, "stalls": 10},
+    {"lat": 37.7749, "lon": -122.4194, "name": "Downtown", "stalls": 10},
 ]
 
 if "depots" not in st.session_state:
@@ -213,14 +283,14 @@ with col_map:
                     n = len(st.session_state.depots) + 1
                     st.session_state.depots.append(
                         {"lat": new_lat, "lon": new_lon, "name": f"Depot {n}",
-                         "lease_per_stall": 2000, "stalls": 10}
+                         "stalls": 10}
                     )
                     st.rerun()
 
 # --- Editable table ---
 with col_edit:
     st.markdown("**Depots**")
-    depot_df = pd.DataFrame(st.session_state.depots) if st.session_state.depots else pd.DataFrame(columns=["lat", "lon", "name", "lease_per_stall", "stalls"])
+    depot_df = pd.DataFrame(st.session_state.depots) if st.session_state.depots else pd.DataFrame(columns=["lat", "lon", "name", "stalls"])
     edited = st.data_editor(
         depot_df,
         num_rows="dynamic",
@@ -228,7 +298,6 @@ with col_edit:
             "lat": st.column_config.NumberColumn("Latitude", min_value=37.5, max_value=38.0, step=0.001, format="%.4f"),
             "lon": st.column_config.NumberColumn("Longitude", min_value=-122.6, max_value=-122.2, step=0.001, format="%.4f"),
             "name": st.column_config.TextColumn("Name"),
-            "lease_per_stall": st.column_config.NumberColumn("Lease $/stall/mo", min_value=0, max_value=50000, step=100, format="$%d"),
             "stalls": st.column_config.NumberColumn("Stalls", min_value=1, max_value=500, step=1),
         },
         key="depot_editor",
@@ -315,6 +384,7 @@ sim_df["cost_depreciation"] = sim_df["distance_miles"] * depreciation_per_mile i
 sim_df["cost_maintenance"] = sim_df["distance_miles"] * maintenance_per_mile if include_maintenance else 0
 sim_df["cost_insurance"] = sim_df["distance_miles"] * insurance_per_mile if include_insurance else 0
 sim_df["cost_tires"] = sim_df["distance_miles"] * tire_per_mile if include_tires else 0
+sim_df["cost_cleaning"] = sim_df["distance_miles"] * cleaning_per_mile if include_cleaning else 0
 # Deadhead costs: all per-mile costs apply to deadhead miles too
 sim_df["cost_deadhead"] = sim_df["deadhead_miles"] * (
     (depreciation_per_mile if include_depreciation else 0)
@@ -328,7 +398,7 @@ if include_deadhead and include_electricity:
 
 # Depot lease: total monthly lease across all depots, spread evenly over all rides
 total_monthly_lease = sum(
-    d.get("lease_per_stall", 0) * d.get("stalls", 0) for d in depots
+    lease_per_stall * d.get("stalls", 0) for d in depots
 )
 sim_df["cost_depot_lease"] = total_monthly_lease / len(sim_df) if include_depot_lease else 0
 
@@ -338,6 +408,7 @@ sim_df["total_cost"] = (
     + sim_df["cost_maintenance"]
     + sim_df["cost_insurance"]
     + sim_df["cost_tires"]
+    + sim_df["cost_cleaning"]
     + sim_df["cost_deadhead"]
     + sim_df["cost_depot_lease"]
 )
@@ -370,10 +441,11 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
 with tab1:
     components = {
         "Electricity": sim_df["cost_electricity"].sum(),
-        "Depreciation": sim_df["cost_depreciation"].sum(),
+        "Vehicle Depreciation": sim_df["cost_depreciation"].sum(),
         "Maintenance": sim_df["cost_maintenance"].sum(),
         "Insurance": sim_df["cost_insurance"].sum(),
         "Tires": sim_df["cost_tires"].sum(),
+        "Cleaning & Plug-ins": sim_df["cost_cleaning"].sum(),
         "Deadhead": sim_df["cost_deadhead"].sum(),
         "Depot Lease": sim_df["cost_depot_lease"].sum(),
     }
@@ -381,13 +453,64 @@ with tab1:
     total_rev_miles = sim_df["distance_miles"].sum()
     cpm = {k: v / total_rev_miles for k, v in components.items()}
 
-    colors = ["#636EFA", "#EF553B", "#00CC96", "#AB63FA", "#FFA15A", "#FF6692", "#19D3F3"]
-    fig = go.Figure(go.Bar(
-        x=list(cpm.keys()),
-        y=list(cpm.values()),
-        marker_color=colors[:len(cpm)],
-    ))
-    fig.update_layout(title="Cost Per Revenue Mile by Component", yaxis_title="$/mile")
+    colors = ["#636EFA", "#EF553B", "#00CC96", "#AB63FA", "#FFA15A", "#B6E880", "#FF6692", "#19D3F3"]
+    fig = go.Figure()
+    cumulative = 0
+    total_cpm = sum(cpm.values())
+    items = sorted(cpm.items(), key=lambda x: x[1], reverse=True)
+    # Threshold: segments under 10% of total get labels offset outside the bar
+    small_offset_idx = 0
+    for i, (name, val) in enumerate(items):
+        fig.add_trace(go.Bar(
+            y=["Cost per mile"],
+            x=[val],
+            name=name,
+            orientation="h",
+            marker_color=colors[i % len(colors)],
+            textposition="none",
+        ))
+        mid_x = cumulative + val / 2
+        is_small = val / total_cpm < 0.10
+        if is_small:
+            # Alternate above/below the bar to avoid overlap
+            y_offset = 45 + 25 * small_offset_idx if small_offset_idx % 2 == 0 else -(45 + 25 * (small_offset_idx - 1))
+            small_offset_idx += 1
+            fig.add_annotation(
+                x=mid_x, y=0,
+                text=f"<b>{name}</b>: ${val:.2f}",
+                showarrow=True,
+                arrowhead=2,
+                arrowwidth=1,
+                arrowcolor="#888",
+                ax=0, ay=y_offset,
+                font=dict(size=12, color="black"),
+                xanchor="center",
+            )
+        else:
+            fig.add_annotation(
+                x=mid_x, y=0,
+                text=f"<b>{name}</b><br>${val:.2f}",
+                showarrow=False,
+                font=dict(size=12, color="black"),
+                xanchor="center",
+            )
+        cumulative += val
+    # Total label to the right of the full bar
+    fig.add_annotation(
+        x=cumulative, y=0,
+        text=f"  <b>Total: ${cumulative:.2f}/mi</b>",
+        showarrow=False,
+        font=dict(size=13),
+        xanchor="left",
+    )
+    fig.update_layout(
+        barmode="stack",
+        title="Cost Per Revenue Mile by Component",
+        xaxis_title="$/mile",
+        yaxis=dict(visible=False),
+        height=350,
+        margin=dict(l=20, r=150, t=40, b=80),
+    )
     st.plotly_chart(fig, use_container_width=True)
 
     st.caption(
