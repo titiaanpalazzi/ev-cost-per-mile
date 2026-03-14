@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Depot Comparison Mockup</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f7f7f8; color: #1a1a2e; padding: 32px; }
+  h1 { font-size: 24px; margin-bottom: 4px; }
+  .subtitle { color: #666; font-size: 14px; margin-bottom: 28px; }
+  .comparison { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; margin-bottom: 32px; }
+  .config { background: #fff; border-radius: 12px; padding: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+  .config-header { display: flex; align-items: center; gap: 10px; margin-bottom: 16px; }
+  .config-label { font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; padding: 3px 10px; border-radius: 4px; }
+  .config-a .config-label { background: #e8f0fe; color: #1a73e8; }
+  .config-b .config-label { background: #fce8e6; color: #d93025; }
+  .config-title { font-size: 18px; font-weight: 600; }
+  .map-placeholder { width: 100%; height: 200px; border-radius: 8px; position: relative; overflow: hidden; margin-bottom: 16px; }
+  .map-a { background: linear-gradient(135deg, #c8d8e8 0%, #a8c0d8 100%); }
+  .map-b { background: linear-gradient(135deg, #c8d8e8 0%, #a8c0d8 100%); }
+  .map-label { position: absolute; bottom: 10px; left: 10px; background: rgba(255,255,255,0.9); padding: 4px 10px; border-radius: 4px; font-size: 12px; color: #555; }
+  .depot-dot { position: absolute; width: 16px; height: 16px; border-radius: 50%; border: 2px solid #fff; box-shadow: 0 1px 3px rgba(0,0,0,0.3); }
+  .depot-dot-a { background: #1a73e8; top: 45%; left: 48%; }
+  .depot-dot-b { background: #d93025; top: 78%; left: 62%; }
+  .depot-dot-label { position: absolute; font-size: 10px; font-weight: 600; color: #333; white-space: nowrap; top: -18px; left: 50%; transform: translateX(-50%); background: rgba(255,255,255,0.85); padding: 1px 5px; border-radius: 3px; }
+  .ride-cloud { position: absolute; width: 120px; height: 100px; border-radius: 50%; background: rgba(99, 110, 250, 0.15); top: 30%; left: 35%; }
+  .metrics { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px; }
+  .metric { background: #f8f9fa; border-radius: 8px; padding: 12px; }
+  .metric-value { font-size: 22px; font-weight: 700; }
+  .metric-label { font-size: 12px; color: #666; margin-top: 2px; }
+  .metric-delta { font-size: 12px; margin-top: 2px; }
+  .delta-up { color: #d93025; }
+  .delta-down { color: #0d904f; }
+
+  /* Stacked bar */
+  .bar-section { margin-top: 12px; }
+  .bar-title { font-size: 13px; font-weight: 600; margin-bottom: 8px; color: #444; }
+  .stacked-bar { display: flex; height: 36px; border-radius: 6px; overflow: hidden; margin-bottom: 6px; }
+  .bar-seg { display: flex; align-items: center; justify-content: center; font-size: 10px; font-weight: 600; color: #fff; white-space: nowrap; overflow: hidden; }
+  .bar-legend { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+  .legend-item { display: flex; align-items: center; gap: 4px; font-size: 11px; color: #555; }
+  .legend-dot { width: 10px; height: 10px; border-radius: 2px; }
+  .total-label { font-size: 14px; font-weight: 700; color: #1a1a2e; text-align: right; }
+
+  /* Depot table */
+  .depot-table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 8px; }
+  .depot-table th { text-align: left; padding: 6px 8px; border-bottom: 2px solid #e0e0e0; color: #666; font-weight: 600; font-size: 11px; text-transform: uppercase; }
+  .depot-table td { padding: 6px 8px; border-bottom: 1px solid #f0f0f0; }
+
+  /* Delta summary */
+  .delta-summary { background: #fff; border-radius: 12px; padding: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); margin-top: 8px; }
+  .delta-summary h3 { font-size: 16px; margin-bottom: 14px; }
+  .delta-row { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #f0f0f0; font-size: 14px; }
+  .delta-row:last-child { border-bottom: none; }
+  .delta-row-label { color: #555; }
+  .delta-row-value { font-weight: 600; }
+
+  .mockup-badge { display: inline-block; background: #fff3cd; color: #856404; font-size: 12px; font-weight: 600; padding: 4px 12px; border-radius: 4px; margin-bottom: 20px; }
+</style>
+</head>
+<body>
+
+<span class="mockup-badge">MOCKUP - Static Preview</span>
+<h1>Depot Configuration Comparison</h1>
+<p class="subtitle">Compare how depot placement affects cost per mile</p>
+
+<div class="comparison">
+  <!-- Config A -->
+  <div class="config config-a">
+    <div class="config-header">
+      <span class="config-label">A</span>
+      <span class="config-title">Downtown SF</span>
+    </div>
+
+    <div class="map-placeholder map-a">
+      <div class="ride-cloud"></div>
+      <div class="depot-dot depot-dot-a">
+        <span class="depot-dot-label">Downtown</span>
+      </div>
+      <span class="map-label">1 depot &middot; 20 stalls</span>
+    </div>
+
+    <table class="depot-table">
+      <tr><th>Depot</th><th>Lat</th><th>Lon</th><th>Stalls</th></tr>
+      <tr><td>Downtown</td><td>37.7749</td><td>-122.4194</td><td>20</td></tr>
+    </table>
+
+    <div class="metrics" style="margin-top: 16px;">
+      <div class="metric">
+        <div class="metric-value">$0.82</div>
+        <div class="metric-label">Cost per mile</div>
+      </div>
+      <div class="metric">
+        <div class="metric-value">4.8%</div>
+        <div class="metric-label">Deadhead %</div>
+      </div>
+      <div class="metric">
+        <div class="metric-value">~3 mi</div>
+        <div class="metric-label">Avg deadhead/charge</div>
+      </div>
+      <div class="metric">
+        <div class="metric-value">4,120</div>
+        <div class="metric-label">Charge events</div>
+      </div>
+    </div>
+
+    <div class="bar-section">
+      <div class="bar-title">Cost per mile breakdown</div>
+      <div class="stacked-bar">
+        <div class="bar-seg" style="width:26%; background:#636EFA;">$0.20</div>
+        <div class="bar-seg" style="width:24%; background:#EF553B;">$0.20</div>
+        <div class="bar-seg" style="width:13%; background:#00CC96;">$0.10</div>
+        <div class="bar-seg" style="width:8%; background:#AB63FA;">$0.06</div>
+        <div class="bar-seg" style="width:6%; background:#FFA15A;">$0.04</div>
+        <div class="bar-seg" style="width:4%; background:#B6E880;"></div>
+        <div class="bar-seg" style="width:3%; background:#FF6692;"></div>
+        <div class="bar-seg" style="width:16%; background:#19D3F3;">$0.13</div>
+      </div>
+      <div class="total-label">Total: $0.82/mi</div>
+    </div>
+  </div>
+
+  <!-- Config B -->
+  <div class="config config-b">
+    <div class="config-header">
+      <span class="config-label">B</span>
+      <span class="config-title">Palo Alto</span>
+    </div>
+
+    <div class="map-placeholder map-b">
+      <div class="ride-cloud"></div>
+      <div class="depot-dot depot-dot-b">
+        <span class="depot-dot-label">Palo Alto</span>
+      </div>
+      <span class="map-label">1 depot &middot; 20 stalls</span>
+    </div>
+
+    <table class="depot-table">
+      <tr><th>Depot</th><th>Lat</th><th>Lon</th><th>Stalls</th></tr>
+      <tr><td>Palo Alto</td><td>37.4419</td><td>-122.1430</td><td>20</td></tr>
+    </table>
+
+    <div class="metrics" style="margin-top: 16px;">
+      <div class="metric">
+        <div class="metric-value" style="color:#d93025;">$1.04</div>
+        <div class="metric-label">Cost per mile</div>
+        <div class="metric-delta delta-up">+$0.22 vs A (+27%)</div>
+      </div>
+      <div class="metric">
+        <div class="metric-value" style="color:#d93025;">28.1%</div>
+        <div class="metric-label">Deadhead %</div>
+        <div class="metric-delta delta-up">+23.3pp vs A</div>
+      </div>
+      <div class="metric">
+        <div class="metric-value">~39 mi</div>
+        <div class="metric-label">Avg deadhead/charge</div>
+        <div class="metric-delta delta-up">+36 mi vs A</div>
+      </div>
+      <div class="metric">
+        <div class="metric-value">4,890</div>
+        <div class="metric-label">Charge events</div>
+        <div class="metric-delta delta-up">+770 vs A</div>
+      </div>
+    </div>
+
+    <div class="bar-section">
+      <div class="bar-title">Cost per mile breakdown</div>
+      <div class="stacked-bar">
+        <div class="bar-seg" style="width:21%; background:#FF6692;">$0.22</div>
+        <div class="bar-seg" style="width:19%; background:#636EFA;">$0.20</div>
+        <div class="bar-seg" style="width:19%; background:#EF553B;">$0.20</div>
+        <div class="bar-seg" style="width:10%; background:#00CC96;">$0.10</div>
+        <div class="bar-seg" style="width:6%; background:#AB63FA;">$0.06</div>
+        <div class="bar-seg" style="width:4%; background:#FFA15A;"></div>
+        <div class="bar-seg" style="width:3%; background:#B6E880;"></div>
+        <div class="bar-seg" style="width:12%; background:#19D3F3;">$0.13</div>
+      </div>
+      <div class="total-label">Total: $1.04/mi</div>
+    </div>
+  </div>
+</div>
+
+<!-- Delta Summary -->
+<div class="delta-summary">
+  <h3>Configuration B vs A: Impact Summary</h3>
+  <div class="delta-row">
+    <span class="delta-row-label">Cost per mile</span>
+    <span class="delta-row-value delta-up">+$0.22/mi (+27%)</span>
+  </div>
+  <div class="delta-row">
+    <span class="delta-row-label">Deadhead share of total miles</span>
+    <span class="delta-row-value delta-up">4.8% &rarr; 28.1%</span>
+  </div>
+  <div class="delta-row">
+    <span class="delta-row-label">Deadhead cost per revenue mile</span>
+    <span class="delta-row-value delta-up">$0.03 &rarr; $0.22 (+$0.19)</span>
+  </div>
+  <div class="delta-row">
+    <span class="delta-row-label">Charge events (more frequent due to deadhead energy use)</span>
+    <span class="delta-row-value delta-up">4,120 &rarr; 4,890 (+19%)</span>
+  </div>
+  <div class="delta-row">
+    <span class="delta-row-label">Electricity cost per mile</span>
+    <span class="delta-row-value delta-up">+$0.02/mi</span>
+  </div>
+
+  <div class="bar-legend" style="margin-top: 16px;">
+    <div class="legend-item"><span class="legend-dot" style="background:#636EFA;"></span> Electricity</div>
+    <div class="legend-item"><span class="legend-dot" style="background:#EF553B;"></span> Vehicle Depreciation</div>
+    <div class="legend-item"><span class="legend-dot" style="background:#00CC96;"></span> Cleaning & Plug-ins</div>
+    <div class="legend-item"><span class="legend-dot" style="background:#AB63FA;"></span> Insurance</div>
+    <div class="legend-item"><span class="legend-dot" style="background:#FFA15A;"></span> Maintenance</div>
+    <div class="legend-item"><span class="legend-dot" style="background:#B6E880;"></span> Tires</div>
+    <div class="legend-item"><span class="legend-dot" style="background:#FF6692;"></span> Deadhead</div>
+    <div class="legend-item"><span class="legend-dot" style="background:#19D3F3;"></span> Depot Lease</div>
+  </div>
+</div>
+
+</body>
+</html>
