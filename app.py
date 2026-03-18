@@ -179,7 +179,7 @@ efficiency = st.sidebar.slider("Efficiency (miles / kWh)", 2.0, 5.0, 3.5, 0.1)
 charge_threshold = st.sidebar.slider("Charge when battery below (%)", 5, 40, 20)
 charge_speed_kw = st.sidebar.slider("Charging speed (kW)", 7, 250, 150)
 
-st.sidebar.header("Cost Parameters")
+st.sidebar.header("Cost Parameters", help="Costs incurred during non-revenue miles are displayed as deadhead.")
 lease_per_stall = st.sidebar.number_input("Lease price ($/stall/mo)", 0, 50000, 800, 100, format="%d")
 purchase_price = st.sidebar.number_input("Vehicle purchase price ($)", 20000, 150000, 85000, 1000)
 lifetime_miles = st.sidebar.number_input("Expected lifetime miles", 50000, 500000, 200000, 10000)
@@ -193,6 +193,10 @@ tire_per_mile = st.sidebar.slider("Tire wear ($/mile)", 0.00, 0.06, 0.02, 0.005)
 # Fixed per-mile costs (no UI controls)
 cleaning_per_mile = 0.07
 maintenance_per_mile = 0.16
+
+st.sidebar.header("Deadhead Opportunity Cost")
+include_opp_cost = st.sidebar.checkbox("Include deadhead mile opportunity cost", True)
+opp_cost_per_mile = st.sidebar.slider("Opportunity cost ($/mile)", 0.50, 3.00, 2.00, 0.10) if include_opp_cost else 0.0
 
 st.sidebar.header("Cost Components")
 include_electricity = st.sidebar.checkbox("Electricity", True)
@@ -282,9 +286,12 @@ def run_simulation(df, depots):
         + (maintenance_per_mile if include_maintenance else 0)
         + (insurance_per_mile if include_insurance else 0)
         + (tire_per_mile if include_tires else 0)
+        + (toll_per_mile if include_tolls else 0)
     ) if include_deadhead else 0
     if include_deadhead and include_electricity:
         sim_df["cost_deadhead"] = sim_df["cost_deadhead"] + sim_df["deadhead_miles"] / efficiency * electricity_offpeak
+
+    sim_df["cost_opp_cost"] = sim_df["deadhead_miles"] * opp_cost_per_mile if include_opp_cost else 0
 
     total_monthly_lease = sum(
         lease_per_stall * d.get("stalls", 0) for d in depots
@@ -300,6 +307,7 @@ def run_simulation(df, depots):
         + sim_df["cost_cleaning"]
         + sim_df["cost_tolls"]
         + sim_df["cost_deadhead"]
+        + sim_df["cost_opp_cost"]
         + sim_df["cost_depot_lease"]
     )
     sim_df["cost_per_mile"] = sim_df["total_cost"] / sim_df["distance_miles"]
@@ -317,13 +325,23 @@ def get_cost_components(sim_df):
         "Tires": sim_df["cost_tires"].sum(),
         "Cleaning & Plug-ins": sim_df["cost_cleaning"].sum(),
         "Tolls": sim_df["cost_tolls"].sum(),
-        "Deadhead": sim_df["cost_deadhead"].sum(),
+        "Deadhead": sim_df["cost_deadhead"].sum() + sim_df["cost_opp_cost"].sum(),
         "Depot Lease": sim_df["cost_depot_lease"].sum(),
     }
     return {k: v for k, v in components.items() if v > 0}
 
 
-COLORS = ["#636EFA", "#EF553B", "#00CC96", "#AB63FA", "#FFA15A", "#B6E880", "#FECB52", "#FF6692", "#19D3F3"]
+CATEGORY_COLORS = {
+    "Electricity": "#636EFA",
+    "Vehicle Depreciation": "#EF553B",
+    "Maintenance": "#00CC96",
+    "Insurance": "#AB63FA",
+    "Tires": "#FFA15A",
+    "Cleaning & Plug-ins": "#B6E880",
+    "Tolls": "#FECB52",
+    "Deadhead": "#FF6692",
+    "Depot Lease": "#19D3F3",
+}
 
 
 def render_stacked_bar(sim_df, height=350):
@@ -343,8 +361,9 @@ def render_stacked_bar(sim_df, height=350):
             x=[val],
             name=name,
             orientation="h",
-            marker_color=COLORS[i % len(COLORS)],
+            marker_color=CATEGORY_COLORS.get(name, "#888888"),
             textposition="none",
+            legendrank=i,
         ))
         mid_x = cumulative + val / 2
         is_small = val / total_cpm < 0.10
@@ -385,6 +404,7 @@ def render_stacked_bar(sim_df, height=350):
         yaxis=dict(visible=False),
         height=height,
         margin=dict(l=20, r=150, t=40, b=80),
+        legend=dict(traceorder="normal"),
     )
     return fig
 
@@ -519,7 +539,7 @@ if page == "Simulator":
     _dh = sim_df["deadhead_miles"].sum()
     _total = sim_df["distance_miles"].sum() + _dh
     col3.metric("Deadhead miles", f"{_dh:,.0f} ({_dh/_total*100:.1f}%)")
-    col4.metric("Avg cost/mile", f"${sim_df['cost_per_mile'].mean():.3f}")
+    col4.metric("Avg cost/mile", f"${sim_df['total_cost'].sum() / sim_df['distance_miles'].sum():.3f}")
     col5.metric("Charge events", f"{len(charge_events):,}")
 
     # --- Charts ---
@@ -656,8 +676,8 @@ elif page == "Compare Depot Locations":
         total_b = sim_b["distance_miles"].sum() + dh_b
         dh_pct_b = dh_b / total_b * 100
 
-        cpm_a = sim_a["cost_per_mile"].mean()
-        cpm_b = sim_b["cost_per_mile"].mean()
+        cpm_a = sim_a["total_cost"].sum() / sim_a["distance_miles"].sum()
+        cpm_b = sim_b["total_cost"].sum() / sim_b["distance_miles"].sum()
 
         with col_a:
             st.markdown("#### Config A")
