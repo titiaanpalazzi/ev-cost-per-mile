@@ -3,171 +3,143 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
-from math import radians, cos, sin, asin, sqrt
 from pathlib import Path
 import json
-from shapely.geometry import shape, Point
-from shapely.prepared import prep
+
+from ev_model import (
+    SimConfig, ALL_COMPONENTS,
+    haversine_vec, nearest_depot, ROAD_FACTOR,
+    load_boundary, generate_sample_data,
+    validate_csv, prepare_rides, MAX_RIDES,
+    run_simulation, get_cost_components, render_stacked_bar,
+    CATEGORY_COLORS,
+)
 
 st.set_page_config(page_title="EV Cost Per Mile", layout="wide")
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def haversine(lat1, lon1, lat2, lon2):
-    """Distance in miles between two lat/lon points."""
-    lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
-    dlat = lat2 - lat1
-    dlon = lon2 - lon1
-    a = sin(dlat / 2) ** 2 + cos(lat1) * cos(lat2) * sin(dlon / 2) ** 2
-    return 2 * 3956 * asin(sqrt(a))
-
-
-def haversine_vec(lat1, lon1, lat2, lon2):
-    """Vectorized haversine for arrays."""
-    lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
-    dlat = lat2 - lat1
-    dlon = lon2 - lon1
-    a = np.sin(dlat / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2) ** 2
-    return 2 * 3956 * np.arcsin(np.sqrt(a))
-
-
-ROAD_FACTOR = 1.3
-
-
-def nearest_depot(lat, lon, depots):
-    """Return (index, distance_miles) to the nearest depot."""
-    if not depots:
-        return None, 0.0
-    dists = [haversine(lat, lon, d["lat"], d["lon"]) * ROAD_FACTOR for d in depots]
-    idx = int(np.argmin(dists))
-    return idx, dists[idx]
-
+DATA_DIR = Path(__file__).parent / "data"
 
 # ---------------------------------------------------------------------------
-# Data
+# Data loading
 # ---------------------------------------------------------------------------
 
-def load_sf_boundary():
-    """Load SF land boundary polygon for filtering points."""
-    from shapely.ops import unary_union
-
-    # Prefer land-clipped census tracts (excludes water)
-    land_path = Path(__file__).parent / "data" / "sf_land.geojson"
-    if land_path.exists():
-        with open(land_path) as f:
-            geojson = json.load(f)
-        # Union all tract polygons to get a single land boundary
-        polygons = [shape(feature["geometry"]) for feature in geojson["features"]]
-        land = unary_union(polygons)
-        return prep(land)
-
-    # Fallback to old boundary file (includes water)
-    boundary_path = Path(__file__).parent / "data" / "sf_boundary.geojson"
-    if boundary_path.exists():
-        with open(boundary_path) as f:
-            geojson = json.load(f)
-        polygon = shape(geojson)
-        return prep(polygon)
-
-    return None
+SF_BOUNDARY = load_boundary(DATA_DIR)
 
 
-SF_BOUNDARY = load_sf_boundary()
-
-
-def point_on_land(lat, lon):
-    """Check if a lat/lon point is within SF land boundary."""
-    if SF_BOUNDARY is None:
-        return True  # No boundary file, accept all points
-    return SF_BOUNDARY.contains(Point(lon, lat))  # Note: Point takes (x, y) = (lon, lat)
-
-
-def generate_sample_data(n=20000, seed=42):
-    """Generate synthetic ride data calibrated to real Waymo ride distributions."""
-    rng = np.random.default_rng(seed)
-
-    # Calibrated from Waymo SF data: center, spread, and dropoff offsets
-    lat_center, lon_center = 37.7611, -122.4383
-    lat_std, lon_std = 0.0269, 0.0324
-
-    # Generate more candidates than needed, then filter to land
-    oversample = 2.5
-    n_candidates = int(n * oversample)
-
-    pickup_lat = rng.normal(lat_center, lat_std, n_candidates)
-    pickup_lon = rng.normal(lon_center, lon_std, n_candidates)
-
-    # Dropoff offset calibrated to match Waymo ~4.2 mi mean, ~4.1 mi median distance
-    dropoff_lat = pickup_lat + rng.normal(0, 0.043, n_candidates)
-    dropoff_lon = pickup_lon + rng.normal(0, 0.043, n_candidates)
-
-    # Filter to points on land
-    if SF_BOUNDARY is not None:
-        valid = []
-        for i in range(n_candidates):
-            if (point_on_land(pickup_lat[i], pickup_lon[i]) and
-                point_on_land(dropoff_lat[i], dropoff_lon[i])):
-                valid.append(i)
-            if len(valid) >= n:
-                break
-        valid = valid[:n]
-        pickup_lat = pickup_lat[valid]
-        pickup_lon = pickup_lon[valid]
-        dropoff_lat = dropoff_lat[valid]
-        dropoff_lon = dropoff_lon[valid]
-        actual_n = len(valid)
-    else:
-        actual_n = n
-        pickup_lat = pickup_lat[:n]
-        pickup_lon = pickup_lon[:n]
-        dropoff_lat = dropoff_lat[:n]
-        dropoff_lon = dropoff_lon[:n]
-
-    base = pd.Timestamp("2024-06-01")
-    timestamps = [base + pd.Timedelta(minutes=int(m)) for m in rng.integers(0, 30 * 24 * 60, actual_n)]
-    # Duration and price calibrated from Waymo: mean ~22 min, median ~21; mean ~$19.7, median ~$18.6
-    durations = rng.exponential(18, actual_n).clip(3, 90)
-    prices = rng.exponential(16, actual_n).clip(5, 80)
-    return pd.DataFrame({
-        "request_timestamp": timestamps,
-        "pickup_latitude": pickup_lat,
-        "pickup_longitude": pickup_lon,
-        "dropoff_latitude": dropoff_lat,
-        "dropoff_longitude": dropoff_lon,
-        "trip_duration_mins": np.round(durations, 1),
-        "price_usd": np.round(prices, 2),
-    })
+def detect_data_centroid(df):
+    """Return (lat, lon) centroid of ride pickup locations."""
+    return float(df["pickup_latitude"].mean()), float(df["pickup_longitude"].mean())
 
 
 @st.cache_data
-def load_data(n_rides=60000, _version=5):  # bump version to invalidate cache
-    data_dir = Path(__file__).parent / "data"
-    csv_path = data_dir / "sf_waymo_estimates.csv"
+def load_default_data(n_rides=60000, _version=5):
+    csv_path = DATA_DIR / "sf_waymo_estimates.csv"
     if csv_path.exists():
         df = pd.read_csv(csv_path)
     else:
-        df = generate_sample_data(n=n_rides)
+        df = generate_sample_data(n=n_rides, boundary=SF_BOUNDARY)
         st.info(
             "Using **simulated rides** based on "
             "[this Kaggle dataset](https://www.kaggle.com/datasets/npurav/waymo-rides-estimates) "
             "of actual Waymo rides."
         )
-    df["distance_miles"] = (
-        haversine_vec(
-            df["pickup_latitude"].values, df["pickup_longitude"].values,
-            df["dropoff_latitude"].values, df["dropoff_longitude"].values,
-        ) * ROAD_FACTOR
-    )
-    df["distance_miles"] = np.clip(df["distance_miles"], a_min=0.1, a_max=None)
-    if "request_timestamp" in df.columns:
-        df["request_timestamp"] = pd.to_datetime(df["request_timestamp"], errors="coerce")
-        df["hour"] = df["request_timestamp"].dt.hour
-    return df
+    return prepare_rides(df)
 
 
-df = load_data()
+def load_template(filename):
+    """Load a city template CSV from the data directory."""
+    path = DATA_DIR / filename
+    if not path.exists():
+        return None
+    df = pd.read_csv(path)
+    df, errors, warnings = validate_csv(df)
+    if errors:
+        return None
+    return prepare_rides(df)
+
+
+# ---------------------------------------------------------------------------
+# Data source selector
+# ---------------------------------------------------------------------------
+
+st.sidebar.header("Data Source")
+
+# Discover available templates
+template_files = sorted(DATA_DIR.glob("*_template.csv"))
+_CITY_ABBREVS = {"La": "LA", "Nyc": "NYC", "Sf": "SF"}
+def _city_label(stem):
+    label = stem.replace("_template", "").replace("_", " ").title()
+    for k, v in _CITY_ABBREVS.items():
+        label = label.replace(k, v)
+    return label
+template_choices = {_city_label(f.stem): f.name for f in template_files}
+
+source_options = ["SF (Waymo)"] + list(template_choices.keys()) + ["Custom (Upload)"]
+data_source = st.sidebar.selectbox("City", source_options)
+
+df = None
+data_source_key = "sf_waymo"
+use_sf_boundary = True
+
+if data_source == "SF (Waymo)":
+    df = load_default_data()
+    data_source_key = "sf_waymo"
+    use_sf_boundary = True
+
+elif data_source == "Custom (Upload)":
+    uploaded = st.sidebar.file_uploader("Upload ride data CSV", type="csv")
+    if uploaded is not None:
+        try:
+            raw = pd.read_csv(uploaded)
+        except Exception as e:
+            st.sidebar.error(f"Could not read CSV: {e}")
+            raw = None
+        if raw is not None:
+            raw, errors, warnings = validate_csv(raw)
+            for w in warnings:
+                st.sidebar.warning(f"⚠️ {w}")
+            if errors:
+                for e in errors:
+                    st.sidebar.error(e)
+                df = None
+            else:
+                df = prepare_rides(raw)
+                data_source_key = "custom_upload"
+                use_sf_boundary = False
+    else:
+        st.sidebar.info("Upload a CSV with pickup/dropoff lat/lon columns, or select a city template above.")
+        _template_csv = "pickup_latitude,pickup_longitude,dropoff_latitude,dropoff_longitude,request_timestamp\n37.7749,-122.4194,37.7849,-122.4094,2024-06-01 08:30:00\n37.7649,-122.4294,37.7749,-122.4194,2024-06-01 09:15:00\n"
+        st.sidebar.download_button(
+            "Download CSV template",
+            data=_template_csv,
+            file_name="ride_data_template.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+        df = load_default_data()
+        data_source_key = "sf_waymo"
+
+elif data_source in template_choices:
+    template_file = template_choices[data_source]
+    df = load_template(template_file)
+    if df is None:
+        st.sidebar.error(f"Could not load template: {template_file}")
+        df = load_default_data()
+    else:
+        st.sidebar.warning("⚠️ Estimated ride distribution. Upload real data for accuracy.")
+        data_source_key = template_file.replace("_template.csv", "_template")
+        use_sf_boundary = False
+
+if df is None:
+    df = load_default_data()
+    data_source_key = "sf_waymo"
+
+# Compute data-driven map center and depot bounds
+map_center_lat, map_center_lon = detect_data_centroid(df)
+lat_min = float(df["pickup_latitude"].min()) - 0.05
+lat_max = float(df["pickup_latitude"].max()) + 0.05
+lon_min = float(df["pickup_longitude"].min()) - 0.05
+lon_max = float(df["pickup_longitude"].max()) + 0.05
 
 # ---------------------------------------------------------------------------
 # Sidebar — vehicle & cost parameters
@@ -190,7 +162,6 @@ toll_per_mile = st.sidebar.slider("Tolls ($/mile)", 0.10, 0.40, 0.25, 0.01)
 insurance_per_mile = st.sidebar.slider("Insurance ($/mile)", 0.10, 0.50, 0.37, 0.01)
 tire_per_mile = st.sidebar.slider("Tire wear ($/mile)", 0.00, 0.06, 0.02, 0.005)
 
-# Fixed per-mile costs (no UI controls)
 cleaning_per_mile = 0.07
 maintenance_per_mile = 0.16
 
@@ -209,204 +180,89 @@ include_tolls = st.sidebar.checkbox("Tolls", True)
 include_deadhead = st.sidebar.checkbox("Deadhead (to depot)", True)
 include_depot_lease = st.sidebar.checkbox("Depot lease", True)
 
-# ---------------------------------------------------------------------------
-# Simulation function (reusable)
-# ---------------------------------------------------------------------------
-
-depreciation_per_mile = purchase_price / lifetime_miles
-
-
-def run_simulation(df, depots):
-    """Run the cost simulation for a given set of depots. Returns (sim_df, charge_events)."""
-    sim_df = df.sort_values("request_timestamp").reset_index(drop=True) if "request_timestamp" in df.columns else df.reset_index(drop=True)
-
-    soc = battery_kwh
-    soc_history = []
-    charge_events = []
-    electricity_cost_per_ride = []
-    deadhead_miles_per_ride = []
-
-    for i, row in sim_df.iterrows():
-        deadhead = 0.0
-
-        # Check if we need to charge
-        if soc / battery_kwh < charge_threshold / 100:
-            if i > 0:
-                prev = sim_df.iloc[i - 1]
-                depot_idx, dist_to_depot = nearest_depot(
-                    prev["dropoff_latitude"], prev["dropoff_longitude"], depots
-                )
-            else:
-                depot_idx, dist_to_depot = nearest_depot(
-                    row["pickup_latitude"], row["pickup_longitude"], depots
-                )
-
-            deadhead = dist_to_depot
-            energy_to_depot = dist_to_depot / efficiency
-            soc = max(0, soc - energy_to_depot)
-
-            kwh_to_charge = battery_kwh - soc
-            hour = row.get("hour", 12)
-            rate = electricity_peak if peak_start <= hour < peak_end else electricity_offpeak
-            cost = kwh_to_charge * rate
-            charge_events.append({
-                "ride_index": i,
-                "depot": depots[depot_idx].get("name", f"Depot {depot_idx+1}"),
-                "deadhead_miles": dist_to_depot,
-                "kwh_charged": kwh_to_charge,
-                "cost": cost,
-                "rate": rate,
-            })
-            soc = battery_kwh
-
-        energy_needed = row["distance_miles"] / efficiency
-        energy_used = min(energy_needed, soc)
-        soc -= energy_used
-
-        hour = row.get("hour", 12)
-        rate = electricity_peak if peak_start <= hour < peak_end else electricity_offpeak
-        electricity_cost_per_ride.append(energy_used * rate)
-        deadhead_miles_per_ride.append(deadhead)
-        soc_history.append(soc)
-
-    sim_df["soc_after"] = soc_history
-    sim_df["electricity_cost"] = electricity_cost_per_ride
-    sim_df["deadhead_miles"] = deadhead_miles_per_ride
-
-    # Cost breakdown per ride
-    sim_df["cost_electricity"] = sim_df["electricity_cost"] if include_electricity else 0
-    sim_df["cost_depreciation"] = sim_df["distance_miles"] * depreciation_per_mile if include_depreciation else 0
-    sim_df["cost_maintenance"] = sim_df["distance_miles"] * maintenance_per_mile if include_maintenance else 0
-    sim_df["cost_insurance"] = sim_df["distance_miles"] * insurance_per_mile if include_insurance else 0
-    sim_df["cost_tires"] = sim_df["distance_miles"] * tire_per_mile if include_tires else 0
-    sim_df["cost_cleaning"] = sim_df["distance_miles"] * cleaning_per_mile if include_cleaning else 0
-    sim_df["cost_tolls"] = sim_df["distance_miles"] * toll_per_mile if include_tolls else 0
-    sim_df["cost_deadhead"] = sim_df["deadhead_miles"] * (
-        (depreciation_per_mile if include_depreciation else 0)
-        + (maintenance_per_mile if include_maintenance else 0)
-        + (insurance_per_mile if include_insurance else 0)
-        + (tire_per_mile if include_tires else 0)
-        + (toll_per_mile if include_tolls else 0)
-    ) if include_deadhead else 0
-    if include_deadhead and include_electricity:
-        sim_df["cost_deadhead"] = sim_df["cost_deadhead"] + sim_df["deadhead_miles"] / efficiency * electricity_offpeak
-
-    sim_df["cost_opp_cost"] = sim_df["deadhead_miles"] * opp_cost_per_mile if include_opp_cost else 0
-
-    total_monthly_lease = sum(
-        lease_per_stall * d.get("stalls", 0) for d in depots
-    )
-    sim_df["cost_depot_lease"] = total_monthly_lease / len(sim_df) if include_depot_lease else 0
-
-    sim_df["total_cost"] = (
-        sim_df["cost_electricity"]
-        + sim_df["cost_depreciation"]
-        + sim_df["cost_maintenance"]
-        + sim_df["cost_insurance"]
-        + sim_df["cost_tires"]
-        + sim_df["cost_cleaning"]
-        + sim_df["cost_tolls"]
-        + sim_df["cost_deadhead"]
-        + sim_df["cost_opp_cost"]
-        + sim_df["cost_depot_lease"]
-    )
-    sim_df["cost_per_mile"] = sim_df["total_cost"] / sim_df["distance_miles"]
-
-    return sim_df, charge_events
-
-
-def get_cost_components(sim_df):
-    """Return dict of cost component totals."""
-    components = {
-        "Electricity": sim_df["cost_electricity"].sum(),
-        "Vehicle Depreciation": sim_df["cost_depreciation"].sum(),
-        "Maintenance": sim_df["cost_maintenance"].sum(),
-        "Insurance": sim_df["cost_insurance"].sum(),
-        "Tires": sim_df["cost_tires"].sum(),
-        "Cleaning & Plug-ins": sim_df["cost_cleaning"].sum(),
-        "Tolls": sim_df["cost_tolls"].sum(),
-        "Deadhead": sim_df["cost_deadhead"].sum() + sim_df["cost_opp_cost"].sum(),
-        "Depot Lease": sim_df["cost_depot_lease"].sum(),
-    }
-    return {k: v for k, v in components.items() if v > 0}
-
-
-CATEGORY_COLORS = {
-    "Electricity": "#636EFA",
-    "Vehicle Depreciation": "#EF553B",
-    "Maintenance": "#00CC96",
-    "Insurance": "#AB63FA",
-    "Tires": "#FFA15A",
-    "Cleaning & Plug-ins": "#B6E880",
-    "Tolls": "#FECB52",
-    "Deadhead": "#FF6692",
-    "Depot Lease": "#19D3F3",
+# Build enabled_components set from checkboxes
+_toggle_map = {
+    "electricity": include_electricity,
+    "depreciation": include_depreciation,
+    "maintenance": include_maintenance,
+    "insurance": include_insurance,
+    "tires": include_tires,
+    "cleaning": include_cleaning,
+    "tolls": include_tolls,
+    "deadhead": include_deadhead,
+    "depot_lease": include_depot_lease,
+    "opp_cost": include_opp_cost,
 }
+enabled_components = {k for k, v in _toggle_map.items() if v}
 
+# Build SimConfig
+config = SimConfig(
+    battery_kwh=battery_kwh,
+    efficiency=efficiency,
+    charge_threshold=charge_threshold,
+    charge_speed_kw=charge_speed_kw,
+    lease_per_stall=lease_per_stall,
+    purchase_price=purchase_price,
+    lifetime_miles=lifetime_miles,
+    electricity_offpeak=electricity_offpeak,
+    electricity_peak=electricity_peak,
+    peak_start=peak_start,
+    peak_end=peak_end,
+    toll_per_mile=toll_per_mile,
+    insurance_per_mile=insurance_per_mile,
+    tire_per_mile=tire_per_mile,
+    cleaning_per_mile=cleaning_per_mile,
+    maintenance_per_mile=maintenance_per_mile,
+    opp_cost_per_mile=opp_cost_per_mile,
+    enabled_components=enabled_components,
+)
 
-def render_stacked_bar(sim_df, height=350):
-    """Render the stacked horizontal cost-per-mile bar chart."""
-    components = get_cost_components(sim_df)
-    total_rev_miles = sim_df["distance_miles"].sum()
-    cpm = {k: v / total_rev_miles for k, v in components.items()}
+# ---------------------------------------------------------------------------
+# Scenario Save / Load
+# ---------------------------------------------------------------------------
 
-    fig = go.Figure()
-    cumulative = 0
-    total_cpm = sum(cpm.values())
-    items = sorted(cpm.items(), key=lambda x: x[1], reverse=True)
-    small_offset_idx = 0
-    for i, (name, val) in enumerate(items):
-        fig.add_trace(go.Bar(
-            y=["Cost per mile"],
-            x=[val],
-            name=name,
-            orientation="h",
-            marker_color=CATEGORY_COLORS.get(name, "#888888"),
-            textposition="none",
-            legendrank=i,
-        ))
-        mid_x = cumulative + val / 2
-        is_small = val / total_cpm < 0.10
-        if is_small:
-            y_offset = 45 + 25 * small_offset_idx if small_offset_idx % 2 == 0 else -(45 + 25 * (small_offset_idx - 1))
-            small_offset_idx += 1
-            fig.add_annotation(
-                x=mid_x, y=0,
-                text=f"<b>{name}</b>: ${val:.2f}",
-                showarrow=True,
-                arrowhead=2,
-                arrowwidth=1,
-                arrowcolor="#888",
-                ax=0, ay=y_offset,
-                font=dict(size=12, color="black"),
-                xanchor="center",
-            )
-        else:
-            fig.add_annotation(
-                x=mid_x, y=0,
-                text=f"<b>{name}</b><br>${val:.2f}",
-                showarrow=False,
-                font=dict(size=12, color="black"),
-                xanchor="center",
-            )
-        cumulative += val
-    fig.add_annotation(
-        x=cumulative, y=0,
-        text=f"  <b>Total: ${cumulative:.2f}/mi</b>",
-        showarrow=False,
-        font=dict(size=13),
-        xanchor="left",
+st.sidebar.header("Scenarios")
+
+col_save, col_load = st.sidebar.columns(2)
+
+with col_save:
+    scenario_name = st.text_input("Scenario name", "My Scenario", label_visibility="collapsed")
+    scenario_dict = config.to_dict()
+    scenario_dict["name"] = scenario_name
+    scenario_dict["data_source"] = data_source_key
+    if "depots" in st.session_state:
+        scenario_dict["depots"] = st.session_state.depots
+    if "compare_depots_a" in st.session_state:
+        scenario_dict["compare_depots_a"] = st.session_state.compare_depots_a
+    if "compare_depots_b" in st.session_state:
+        scenario_dict["compare_depots_b"] = st.session_state.compare_depots_b
+
+    st.download_button(
+        "Save Scenario",
+        data=json.dumps(scenario_dict, indent=2),
+        file_name=f"{scenario_name.replace(' ', '_').lower()}.json",
+        mime="application/json",
+        use_container_width=True,
     )
-    fig.update_layout(
-        barmode="stack",
-        title="Cost Per Revenue Mile by Component",
-        xaxis_title="$/mile",
-        yaxis=dict(visible=False),
-        height=height,
-        margin=dict(l=20, r=150, t=40, b=80),
-        legend=dict(traceorder="normal"),
-    )
-    return fig
+
+with col_load:
+    scenario_file = st.file_uploader("Load Scenario", type="json", label_visibility="collapsed")
+    if scenario_file is not None:
+        try:
+            scenario_data = json.loads(scenario_file.read())
+            loaded_config = SimConfig.from_dict(scenario_data)
+            # Restore depots
+            if "depots" in scenario_data:
+                st.session_state.depots = scenario_data["depots"]
+            if "compare_depots_a" in scenario_data:
+                st.session_state.compare_depots_a = scenario_data["compare_depots_a"]
+            if "compare_depots_b" in scenario_data:
+                st.session_state.compare_depots_b = scenario_data["compare_depots_b"]
+            st.sidebar.success(f"Loaded scenario: {scenario_data.get('name', 'unnamed')}")
+            st.sidebar.info("Note: Sidebar sliders show defaults. Re-run the simulation to apply loaded values.")
+        except (json.JSONDecodeError, Exception) as e:
+            st.sidebar.error(f"Invalid scenario file: {e}")
+
 
 # ---------------------------------------------------------------------------
 # Page navigation
@@ -435,7 +291,7 @@ if page == "Simulator":
     )
 
     DEFAULT_DEPOTS = [
-        {"lat": 37.7749, "lon": -122.4194, "name": "Downtown", "stalls": 10},
+        {"lat": round(map_center_lat, 4), "lon": round(map_center_lon, 4), "name": "Central", "stalls": 10},
     ]
 
     if "depots" not in st.session_state:
@@ -444,8 +300,8 @@ if page == "Simulator":
     col_map, col_edit = st.columns([2, 1])
 
     with col_map:
-        grid_lat = np.linspace(37.70, 37.84, 40)
-        grid_lon = np.linspace(-122.52, -122.34, 40)
+        grid_lat = np.linspace(lat_min, lat_max, 40)
+        grid_lon = np.linspace(lon_min, lon_max, 40)
         glat, glon = np.meshgrid(grid_lat, grid_lon)
         glat, glon = glat.ravel(), glon.ravel()
 
@@ -476,7 +332,11 @@ if page == "Simulator":
                 name="Depots",
             ))
         fig_map.update_layout(
-            mapbox=dict(style="open-street-map", center=dict(lat=37.77, lon=-122.42), zoom=11),
+            mapbox=dict(
+                style="open-street-map",
+                center=dict(lat=map_center_lat, lon=map_center_lon),
+                zoom=11,
+            ),
             margin=dict(l=0, r=0, t=0, b=0),
             height=450,
             showlegend=True,
@@ -511,8 +371,8 @@ if page == "Simulator":
             depot_df,
             num_rows="dynamic",
             column_config={
-                "lat": st.column_config.NumberColumn("Latitude", min_value=37.5, max_value=38.0, step=0.001, format="%.4f"),
-                "lon": st.column_config.NumberColumn("Longitude", min_value=-122.6, max_value=-122.2, step=0.001, format="%.4f"),
+                "lat": st.column_config.NumberColumn("Latitude", min_value=lat_min, max_value=lat_max, step=0.001, format="%.4f"),
+                "lon": st.column_config.NumberColumn("Longitude", min_value=lon_min, max_value=lon_max, step=0.001, format="%.4f"),
                 "name": st.column_config.TextColumn("Name"),
                 "stalls": st.column_config.NumberColumn("Stalls", min_value=1, max_value=500, step=1),
             },
@@ -529,7 +389,7 @@ if page == "Simulator":
         st.stop()
 
     # --- Run simulation ---
-    sim_df, charge_events = run_simulation(df, depots)
+    sim_df, charge_events = run_simulation(df, depots, config)
 
     # --- Metrics ---
     st.divider()
@@ -594,6 +454,39 @@ if page == "Simulator":
         else:
             st.info("No charge events occurred during this simulation.")
 
+    # --- Export ---
+    st.divider()
+    st.subheader("Export")
+    export_col1, export_col2 = st.columns(2)
+
+    with export_col1:
+        csv_data = sim_df.to_csv(index=False)
+        st.download_button(
+            "Download simulation CSV",
+            data=csv_data,
+            file_name="ev_simulation_results.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+    with export_col2:
+        try:
+            from export import generate_pdf
+            pdf_bytes = generate_pdf(sim_df, config, depots)
+            if pdf_bytes:
+                st.download_button(
+                    "Download PDF report",
+                    data=pdf_bytes,
+                    file_name="ev_cost_report.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                )
+        except ImportError:
+            st.info("PDF export requires `fpdf2` and `kaleido`. Install with: `pip install fpdf2 kaleido`")
+        except Exception as e:
+            st.error(f"PDF generation failed: {e}")
+
+
 # =========================================================================
 # PAGE: Compare Depot Locations
 # =========================================================================
@@ -601,25 +494,25 @@ if page == "Simulator":
 elif page == "Compare Depot Locations":
 
     st.subheader("Compare Depot Configurations")
-    st.caption("This assumes the same simulated rides as the Simulator page. Edit the depot tables below, then press **Run Comparison** to simulate both configurations side by side.")
+    st.caption("This assumes the same ride data as the Simulator page. Edit the depot tables below, then press **Run Comparison** to simulate both configurations side by side.")
 
-    # Defaults for the two configs
     if "compare_depots_a" not in st.session_state:
         st.session_state.compare_depots_a = [
-            {"name": "Downtown", "lat": 37.7749, "lon": -122.4194, "stalls": 20},
+            {"name": "Central A", "lat": round(map_center_lat, 4), "lon": round(map_center_lon, 4), "stalls": 20, "lease_per_stall": 800},
         ]
     if "compare_depots_b" not in st.session_state:
         st.session_state.compare_depots_b = [
-            {"name": "San Bruno", "lat": 37.6305, "lon": -122.4111, "stalls": 20},
+            {"name": "Alt Site B", "lat": round(map_center_lat + 0.05, 4), "lon": round(map_center_lon + 0.02, 4), "stalls": 20, "lease_per_stall": 800},
         ]
 
     col_a, col_b = st.columns(2)
 
     depot_col_config = {
         "name": st.column_config.TextColumn("Name"),
-        "lat": st.column_config.NumberColumn("Latitude", min_value=36.0, max_value=39.0, step=0.001, format="%.4f"),
-        "lon": st.column_config.NumberColumn("Longitude", min_value=-123.5, max_value=-121.0, step=0.001, format="%.4f"),
+        "lat": st.column_config.NumberColumn("Latitude", min_value=lat_min, max_value=lat_max, step=0.001, format="%.4f"),
+        "lon": st.column_config.NumberColumn("Longitude", min_value=lon_min, max_value=lon_max, step=0.001, format="%.4f"),
         "stalls": st.column_config.NumberColumn("Stalls", min_value=1, max_value=500, step=1),
+        "lease_per_stall": st.column_config.NumberColumn("Lease ($/stall/mo)", min_value=0, max_value=50000, step=100, format="%d"),
     }
 
     with col_a:
@@ -652,8 +545,8 @@ elif page == "Compare Depot Locations":
             st.stop()
 
         with st.spinner("Running simulations..."):
-            sim_a, ce_a = run_simulation(df, depots_a)
-            sim_b, ce_b = run_simulation(df, depots_b)
+            sim_a, ce_a = run_simulation(df, depots_a, config, override_lease=True)
+            sim_b, ce_b = run_simulation(df, depots_b, config, override_lease=True)
 
         # --- Metrics side by side ---
         st.divider()
@@ -730,3 +623,35 @@ elif page == "Compare Depot Locations":
             "Difference": f"${total_b_cpm - total_a_cpm:+.3f}",
         })
         st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+
+        # --- Comparison Export ---
+        st.divider()
+        st.subheader("Export")
+        export_col1, export_col2 = st.columns(2)
+
+        with export_col1:
+            summary_csv = pd.DataFrame(summary_rows).to_csv(index=False)
+            st.download_button(
+                "Download comparison CSV",
+                data=summary_csv,
+                file_name="ev_comparison_results.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+
+        with export_col2:
+            try:
+                from export import generate_comparison_pdf
+                pdf_bytes = generate_comparison_pdf(sim_a, sim_b, config, depots_a, depots_b)
+                if pdf_bytes:
+                    st.download_button(
+                        "Download comparison PDF",
+                        data=pdf_bytes,
+                        file_name="ev_comparison_report.pdf",
+                        mime="application/pdf",
+                        use_container_width=True,
+                    )
+            except ImportError:
+                st.info("PDF export requires `fpdf2` and `kaleido`. Install with: `pip install fpdf2 kaleido`")
+            except Exception as e:
+                st.error(f"PDF generation failed: {e}")
